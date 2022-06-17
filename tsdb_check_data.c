@@ -30,6 +30,7 @@ static int32_t dataStatisCheckType1(SReadH *pReadH, uint64_t suid, uint64_t uid,
 static int32_t dataStatisCheckType2(SReadH *pReadH, int32_t vgId, uint32_t *nRows);
 static int32_t getDFile(SReadH *pReadH, const char *fullName);
 static int32_t tsdbGetRowsOfBlockInfo(SReadH *pReadH, uint32_t *nRows);
+static int32_t checkType3_Vnodes(const char* taosDataDir);
 
 int32_t checkParams(int32_t argc, char *argv[])
 {
@@ -359,6 +360,133 @@ static int32_t checkType2_Vid(int32_t vgId)
 	return TSDB_CODE_SUCCESS;
 }
 
+static int tsdbFetchDir(const char *dataDir, SArray **fArray)
+{
+	//   const char * pattern = "^v[0-9]+f[0-9]+\\.(head|data|last|smad|smal)(-ver[0-9]+)?$";
+	const char *pattern = "^vnode[0-9]+f[0-9]+\\.(head)(-ver[0-9]+)?$";
+	regex_t regex;
+	struct dirent *ptr = NULL;
+
+	// Resource allocation and init
+	regcomp(&regex, pattern, REG_EXTENDED);
+
+	*fArray = taosArrayInit(1024, TSDB_FILENAME_LEN);
+	if (*fArray == NULL)
+	{
+		printf("%" PRId64 ":%s failed to fetch TFileSet Array from %s since OOM\n", taosGetTimestampMs(), __func__, dataDir);
+		regfree(&regex);
+		return -1;
+	}
+
+	DIR *dir = opendir(dataDir);
+	if (dir == NULL)
+	{
+		printf("%" PRId64 ":%s failed to open dir %s\n", taosGetTimestampMs(), __func__, dataDir);
+		regfree(&regex);
+		taosArrayDestroy(*fArray);
+		return -1;
+	}
+
+	while ((ptr = readdir(dir)) != NULL)
+	{
+		if (strcmp(ptr->d_name, ".") == 0 || strcmp(ptr->d_name, "..") == 0)
+		{
+			continue;
+		}
+		int code = regexec(&regex, ptr->d_name, 0, NULL, 0);
+		if (code == 0)
+		{
+			printf("%" PRId64 ":%s fetch head file: %s\n", taosGetTimestampMs(), __func__, ptr->d_name);
+			if (taosArrayPush(*fArray, (void *)ptr->d_name) == NULL)
+			{
+				printf("%" PRId64 ":%s failed to push file from %s since OOM\n", taosGetTimestampMs(), __func__, dataDir);
+				closedir(dir);
+				taosArrayDestroy(*fArray);
+				regfree(&regex);
+				return -1;
+			}
+		}
+		else if (code == REG_NOMATCH)
+		{
+			// NOTHING TODO
+		}
+		else
+		{
+			// Has other error
+			printf("%" PRId64 ":%s failed to fetch TFileSet Array while run regexec since %d\n", taosGetTimestampMs(), __func__, code);
+			closedir(dir);
+			regfree(&regex);
+			taosArrayDestroy(*fArray);
+			return -1;
+		}
+	}
+
+	closedir(dir);
+	regfree(&regex);
+
+	return 0;
+}
+
+static int32_t checkType3_Vnodes(const char *taosDataDir)
+{
+	printf("%" PRId64 ":%s taosDataDir:%s\n", taosGetTimestampMs(), __func__, taosDataDir);
+	if (!taosDataDir)
+	{
+		printf("%" PRId64 ":%s invalid parameters taosDataDir: %s\n", taosGetTimestampMs(), __func__, taosDataDir ? taosDataDir : "NULL");
+		return -1;
+	}
+
+	char tsdbDir[4096] = {0};
+	snprintf(tsdbDir, 4096, "%s/vnode/vnode%d/tsdb/data", gDataDir, vgId);
+	printf("%" PRId64 ":%s tsdbDir = %s\n", taosGetTimestampMs(), __func__, tsdbDir);
+
+	SArray *fArray = NULL;
+	size_t fArraySize = 0;
+
+	if (tsdbFetchDir(tsdbDir, &fArray) < 0)
+	{
+		printf("%" PRId64 ":%s failed to fetch head files from %s\n", taosGetTimestampMs(), __func__, tsdbDir);
+		return -1;
+	}
+
+	if ((fArraySize = taosArrayGetSize(fArray)) <= 0)
+	{
+		taosArrayDestroy(fArray);
+		printf("%" PRId64 ":%s size of head files from %s is %" PRIu32 "\n", taosGetTimestampMs(), __func__, tsdbDir, (uint32_t)fArraySize);
+		return 0;
+	}
+
+	SReadH readh = {0};
+	SReadH *pReadH = &readh;
+	tsdbInitReadH(pReadH);
+	SDFile headFile = {0};
+	pReadH->headFile = &headFile;
+	tsdbCloseDFile(pReadH->headFile);
+	uint32_t nTotalRows = 0;
+
+	for (size_t index = 0; index < fArraySize; ++index)
+	{
+		uint32_t nRows = 0;
+		char bname[TSDB_FILENAME_LEN] = "\0";
+		char fullName[4228] = "\0";
+		tstrncpy(bname, (char *)taosArrayGet(fArray, index), TSDB_FILENAME_LEN);
+		snprintf(fullName, 4228, "%s/%s", tsdbDir, bname);
+		printf("%" PRId64 ":%s from %s head is %s\n", taosGetTimestampMs(), __func__, tsdbDir, fullName);
+
+		getDFile(pReadH, fullName);
+		dataStatisCheckType2(pReadH, vgId, &nRows);
+		tsdbResetReadFile(pReadH);
+		nTotalRows += nRows;
+	}
+
+	printf("%" PRId64 ":%s vgId:%d, totalRows is %" PRIu32 " in %s\n", taosGetTimestampMs(), __func__,
+		   vgId, nTotalRows, tsdbDir);
+	tsdbDestroyReadH(pReadH);
+	taosArrayDestroy(fArray);
+
+	return TSDB_CODE_SUCCESS;
+}
+
 static int32_t getDFile(SReadH *pReadH, const char *fullName)
 {
 	SDFile *pHeadFile = pReadH->headFile;
@@ -507,6 +635,7 @@ int main(int32_t argc, char *argv[])
 	printf("%" PRId64 ":%s ====== informal tsdb data check tools(count nRows in dataDir by uid/tid/vid)\n", taosGetTimestampMs(), __func__);
 	printf("%" PRId64 ":%s ====== e.g. program -check 1 -d /dataDir -suid 123 -uid 123 -vid 3\n", taosGetTimestampMs(), __func__);
 	printf("%" PRId64 ":%s ====== e.g. program -check 2 -d /dataDir -vid 3\n", taosGetTimestampMs(), __func__);
+	printf("%" PRId64 ":%s ====== e.g. program -check 3 -d /dataDir\n", taosGetTimestampMs(), __func__);
 	printf("%" PRId64 ":%s ====== start\n", taosGetTimestampMs(), __func__);
 	if (checkParams(argc, argv) != 0)
 	{
@@ -523,6 +652,9 @@ int main(int32_t argc, char *argv[])
 		break;
 	case CHECK_LIST_DATA_OF_VID:
 		code = checkType2_Vid(gVgId);
+		break;
+	case CHECK_LIST_DATA_OF_VNODES:
+		code = checkType3_Vnodes(gDataDir);
 		break;
 	default:
 		printf("%" PRId64 ":%s ====== WARN - check type %d not support yet\n", taosGetTimestampMs(), __func__, gCheckType);
